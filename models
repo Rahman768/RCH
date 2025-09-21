@@ -1,1 +1,270 @@
+# models/teachernet.py
+
+from typing import List, Tuple, Union
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+
+
+class SqueezeExcitationBlock(nn.Module):
+    def __init__(self, in_channels: int, reduction: int = 16):
+        super().__init__()
+        self.in_channels = in_channels
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc1 = nn.Conv3d(in_channels, in_channels // reduction, 1)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv3d(in_channels // reduction, in_channels, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"[SE Block] Channel mismatch! Expected {self.in_channels} but got {x.shape[1]}"
+            )
+        se_weight = self.sigmoid(self.fc2(self.relu(self.fc1(self.global_pool(x)))))
+        return x * se_weight
+
+
+class CBAMBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.max_pool = nn.AdaptiveMaxPool3d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv3d(channels, channels // 16, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(channels // 16, channels, 1),
+        )
+        self.sigmoid_channel = nn.Sigmoid()
+        self.spatial = nn.Conv3d(2, 1, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        avg = self.mlp(self.avg_pool(x))
+        max_ = self.mlp(self.max_pool(x))
+        channel_att = self.sigmoid_channel(avg + max_)
+        x = x * channel_att
+
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_att = self.spatial(torch.cat([avg_out, max_out], dim=1))
+        spatial_att = torch.sigmoid(spatial_att)
+        return x * spatial_att
+
+
+class KANBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.kan = nn.Sequential(
+            nn.Conv3d(channels, channels, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(channels, channels, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.kan(x)
+
+
+class AxialAttention(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.inter_channels = in_channels // 8
+        self.conv_q = nn.Conv3d(in_channels, self.inter_channels, kernel_size=1)
+        self.conv_k = nn.Conv3d(in_channels, self.inter_channels, kernel_size=1)
+        self.conv_v = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, d, h, w = x.size()
+        if c != self.in_channels:
+            raise ValueError(
+                f"[AxialAttention] Expected {self.in_channels} channels, but got {c}"
+            )
+        q = self.conv_q(x).view(b, -1, d * h * w).permute(0, 2, 1)  # (b, N, C')
+        k = self.conv_k(x).view(b, -1, d * h * w)                    # (b, C', N)
+        v = self.conv_v(x).view(b, -1, d * h * w)                    # (b, C,  N)
+
+        attn = self.softmax(torch.bmm(q, k))                         # (b, N, N)
+        out = torch.bmm(v, attn.permute(0, 2, 1))                    # (b, C, N)
+        out = out.view(b, c, d, h, w)
+        return out + x
+
+
+# 3D Patch operations
+patch_aggregation = lambda x: F.avg_pool3d(x, kernel_size=2, stride=2)
+
+def patch_merging(x: torch.Tensor) -> torch.Tensor:
+    if min(x.shape[2:]) >= 2:
+        return F.avg_pool3d(x, kernel_size=2, stride=2)
+    else:
+        return x
+
+
+class SwinTransformer3DBlock(nn.Module):
+    def __init__(self, in_channels: int, embed_dim: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.proj = nn.Linear(in_channels, embed_dim)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, batch_first=True)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+
+    def forward_fn(self, x: torch.Tensor) -> torch.Tensor:
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x_res = x + attn_out
+        x_norm2 = self.norm2(x_res)
+        ffn_out = self.ffn(x_norm2)
+        return x_res + ffn_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, D, H, W = x.shape
+        x_lin = x.view(B, C, -1).permute(0, 2, 1)  # (B, N, C)
+        if C != self.embed_dim:
+            x_lin = self.proj(x_lin)
+        x_lin = checkpoint.checkpoint(self.forward_fn, x_lin)
+        return x_lin.permute(0, 2, 1).view(B, self.embed_dim, D, H, W)
+
+
+class FCM(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.compress = nn.Conv3d(in_channels, in_channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.compress(x)
+
+
+class CAF(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.align = nn.Conv3d(in_channels, in_channels, 1)
+
+    def forward(self, enc_feat: torch.Tensor, dec_feat: torch.Tensor) -> torch.Tensor:
+        return enc_feat + self.align(dec_feat)
+
+
+
+class TeacherNet(nn.Module):
+    """
+    Teacher network with:
+      - Encoder: SwinTransformer3DBlock + Conv + Dropout3d + SE
+      - Bottleneck: KAN + (Swin path || Conv path) + Axial + SE
+      - Decoder: upconvs with CAF/FCM skip fusion + Swin + Conv + Dropout3d + SE
+      - Output: CBAM + 1x1 Conv to out_channels
+
+    Args:
+        in_channels: number of input channels (e.g., 4 for BraTS modalities)
+        out_channels: number of output classes (e.g., 4 for [bg, NCR/NET, ED, ET])
+    """
+    def __init__(self, in_channels: int = 4, out_channels: int = 4):
+        super().__init__()
+        channels = [64, 128, 256, 512, 1024]
+        self.patch_agg = patch_aggregation
+
+       
+        self.encoder_stages = nn.ModuleList()
+        current_in_ch = in_channels
+        for ch in channels:
+            swin = SwinTransformer3DBlock(in_channels=current_in_ch, embed_dim=ch)
+            conv = nn.Conv3d(ch, ch, 3, padding=1)
+            drop = nn.Dropout3d(p=0.1)
+            se = SqueezeExcitationBlock(ch)
+            self.encoder_stages.append(nn.Sequential(swin, conv, drop, se))
+            current_in_ch = ch
+
+        
+        self.kan = KANBlock(channels[-1])
+        self.bottleneck_swin = SwinTransformer3DBlock(in_channels=channels[-1], embed_dim=channels[-1])
+        self.bottleneck_conv = nn.Conv3d(channels[-1], channels[-1], kernel_size=3, padding=1)
+
+        bottleneck_channels = channels[-1] * 2  # 2048
+        self.axial = AxialAttention(in_channels=bottleneck_channels)
+        self.se_bottleneck = SqueezeExcitationBlock(bottleneck_channels)
+
+        
+        self.upconvs = nn.ModuleList([
+            nn.ConvTranspose3d(channels[i]*2 if i == 4 else channels[i], channels[i - 1], kernel_size=2, stride=2)
+            for i in range(4, 0, -1)
+        ])
+        self.decoder_stages = nn.ModuleList([
+            nn.Sequential(
+                SwinTransformer3DBlock(in_channels=channels[i - 1] * 2, embed_dim=channels[i - 1]),
+                nn.Conv3d(channels[i - 1], channels[i - 1], 3, padding=1),
+                nn.Dropout3d(p=0.1),
+                SqueezeExcitationBlock(channels[i - 1]),
+            )
+            for i in range(4, 0, -1)
+        ])
+
+        
+        self.fcm = nn.ModuleList([FCM(ch) for ch in channels[3::-1]])
+        self.caf = nn.ModuleList([CAF(ch) for ch in channels[3::-1]])
+
+        
+        self.cbam = CBAMBlock(channels[0])
+        self.final_conv = nn.Conv3d(channels[0], out_channels, kernel_size=1)
+
+    def forward(
+        self, x: torch.Tensor, return_features: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]]:
+        enc_feats: List[torch.Tensor] = []
+        x = self.patch_agg(x)
+
+        for stage in self.encoder_stages:
+            x = stage(x)
+            enc_feats.append(x)
+            x = patch_merging(x)
+
+        x = self.kan(x)
+        swin_path = self.bottleneck_swin(x)
+        conv_path = self.bottleneck_conv(x)
+        x = torch.cat([swin_path, conv_path], dim=1)
+        x = self.axial(x)
+        x = self.se_bottleneck(x)
+
+        bottleneck_out = x
+        low_level_feat = enc_feats[1]  # can change to 0 or 2 if desired
+
+        for i in range(4):
+            x = self.upconvs[i](x)
+            enc_feat = self.fcm[i](enc_feats[3 - i])
+            dec_feat = x
+
+            if enc_feat.shape[-3:] != dec_feat.shape[-3:]:
+                enc_feat = F.interpolate(
+                    enc_feat, size=dec_feat.shape[-3:], mode='trilinear', align_corners=False
+                )
+
+            skip = self.caf[i](enc_feat, dec_feat)
+            x = torch.cat([x, skip], dim=1)
+            x = self.decoder_stages[i](x)
+
+        x = self.cbam(x)
+        final_out = self.final_conv(x)
+
+        if return_features:
+            return final_out, bottleneck_out, [low_level_feat]
+        else:
+            return final_out
+
+
+__all__ = [
+    "TeacherNet",
+    "SqueezeExcitationBlock",
+    "CBAMBlock",
+    "KANBlock",
+    "AxialAttention",
+    "SwinTransformer3DBlock",
+    "FCM",
+    "CAF",
+    "patch_aggregation",
+    "patch_merging",
+]
 
